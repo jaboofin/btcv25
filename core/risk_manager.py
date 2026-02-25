@@ -26,6 +26,8 @@ class DailyStats:
     start_of_day_capital: float = 0.0
     # ── Late-window tracking (Phase 2) ──
     late_window_trades: int = 0
+    late_window_wins: int = 0
+    late_window_losses: int = 0
     late_window_pnl: float = 0.0
     late_window_spent: float = 0.0
     # ── 5m tracking (Phase 3) ──
@@ -136,16 +138,28 @@ class RiskManager:
     def get_status(self) -> dict:
         self._reset_daily_if_needed()
         can, reason = self.can_trade()
+        # Calculate daily_loss_pct using start-of-day reference
+        reference = self._daily.start_of_day_capital or self.capital
+        daily_loss_pct = abs(min(0, self._daily.total_pnl)) / reference * 100 if reference > 0 else 0
         return {
             "can_trade": can, "reason": reason, "capital": self.capital,
             "daily_trades": self._daily.trades, "daily_pnl": self._daily.total_pnl,
+            "daily_loss_pct": round(daily_loss_pct, 2),
             "consecutive_losses": self._daily.consecutive_losses,
             "in_cooldown": time.time() < self._daily.cooldown_until,
             "total_pnl": self._total_pnl,
-            # Phase 2
+            # Phase 2 — Late Window
             "late_window_trades": self._daily.late_window_trades,
+            "late_window_wins": self._daily.late_window_wins,
+            "late_window_losses": self._daily.late_window_losses,
             "late_window_pnl": round(self._daily.late_window_pnl, 2),
             "late_window_spent": round(self._daily.late_window_spent, 2),
+            # Phase 3 — 5m
+            "5m_trades": self._daily.trades_5m,
+            "5m_wins": self._daily.wins_5m,
+            "5m_losses": self._daily.losses_5m,
+            "5m_pnl": round(self._daily.pnl_5m, 2),
+            "5m_spent": round(self._daily.spent_5m, 2),
         }
 
     # ── Late-Window Risk (Phase 2) ────────────────────────────
@@ -187,6 +201,10 @@ class RiskManager:
         self._daily.late_window_spent += size_usd
         if pnl != 0:
             self._daily.late_window_pnl += pnl
+            if pnl >= 0:
+                self._daily.late_window_wins += 1
+            else:
+                self._daily.late_window_losses += 1
 
     # ── 5m Risk (Phase 3) ─────────────────────────────────────
 

@@ -657,6 +657,56 @@ class PolymarketClient:
                 logger.error(f"FAILED: {resp.get('errorMsg', 'unknown')} ({status})")
                 return None
 
+            # ── Handle resting "live" orders (not yet filled) ─────
+            # A "live" status means the order is on the book but NOT matched.
+            # Wait briefly for a fill, then cancel if still resting.
+            if status == "live" and not success:
+                live_order_id = resp.get("orderID", "")
+                if live_order_id:
+                    logger.info(f"🟡 Order resting (status=live) — waiting 12s for fill...")
+                    await asyncio.sleep(12)
+                    try:
+                        order_info = await asyncio.to_thread(
+                            self._clob.get_order, live_order_id
+                        )
+                        live_check_status = (order_info or {}).get("status", "").lower()
+                        if live_check_status in ("matched", "filled"):
+                            logger.info(f"✅ Resting order filled: {live_order_id[:20]}...")
+                            success = True
+                            status = "matched"
+                            tx_hashes = (order_info or {}).get("transactionsHashes", tx_hashes)
+                        else:
+                            # Still resting — cancel it
+                            try:
+                                self._clob.cancel(live_order_id)
+                                logger.warning(f"🚫 Resting order cancelled after 12s — no fill (status={live_check_status})")
+                            except Exception:
+                                # Cancel failed — might have filled in the meantime
+                                logger.info(f"Cancel failed (may have filled) — re-checking...")
+                                try:
+                                    order_info2 = await asyncio.to_thread(
+                                        self._clob.get_order, live_order_id
+                                    )
+                                    recheck_status = (order_info2 or {}).get("status", "").lower()
+                                    if recheck_status in ("matched", "filled"):
+                                        logger.info(f"✅ Order filled during cancel attempt")
+                                        success = True
+                                        status = "matched"
+                                        tx_hashes = (order_info2 or {}).get("transactionsHashes", tx_hashes)
+                                    else:
+                                        logger.error(f"🚫 Order in limbo: status={recheck_status}. NOT recording.")
+                                        return None
+                                except Exception:
+                                    logger.error(f"🚫 Cannot verify resting order. NOT recording.")
+                                    return None
+                            return None
+                    except Exception as e:
+                        logger.error(f"🚫 Failed to check resting order: {e}. NOT recording.")
+                        return None
+                else:
+                    logger.error(f"🚫 Live order with no orderID. NOT recording.")
+                    return None
+
             # ── Fill Verification ──────────────────────────────────
             # CLOB can return success=true but settlement may fail.
             # Wait briefly then re-check order status to confirm.

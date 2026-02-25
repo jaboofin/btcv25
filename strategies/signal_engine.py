@@ -285,6 +285,21 @@ class StrategyEngine:
             self._signal_ema_cross(candles),
         ])
 
+        # ── Chop filter: indicators split 2v2 = no trend ──
+        if open_price and open_price > 0:
+            indicator_dirs = [s.direction for s in signals if s.name != "price_vs_open" and s.direction != MarketDirection.HOLD]
+            if len(indicator_dirs) >= 4:
+                up_count = sum(1 for d in indicator_dirs if d == MarketDirection.UP)
+                down_count = sum(1 for d in indicator_dirs if d == MarketDirection.DOWN)
+                pvo_drift = abs(((current_price - open_price) / open_price) * 100)
+                if up_count == 2 and down_count == 2 and pvo_drift < 0.12:
+                    logger.info(f"Chop filter: indicators split 2v2, drift {pvo_drift:.4f}% < 0.12% — holding")
+                    return StrategyDecision(
+                        MarketDirection.HOLD, 0.0, signals, current_price, open_price,
+                        drift_pct, volatility, False,
+                        f"Chop detected: indicators split 2v2, drift only {pvo_drift:.4f}%", 0.0,
+                    )
+
         # ── Weighted score ──
         up_score = 0.0
         down_score = 0.0
@@ -308,15 +323,31 @@ class StrategyEngine:
 
         confidence *= min(1.0, total / 0.5)
 
+        # ── Cap confidence to prevent oversizing ──
+        # With 70% weight on price_vs_open, lopsided scores can push
+        # confidence to 1.0, causing Kelly to max out position size.
+        # Cap at 0.92 — still a strong signal, but keeps sizing sane.
+        confidence = min(confidence, 0.92)
+
         # ── Signal agreement filter ──
-        # If price_vs_open has a clear direction but 3+ indicators disagree,
-        # the technical picture is fighting the drift. Skip these conflicted trades.
+        # If price_vs_open has a clear direction but indicators disagree,
+        # the technical picture is fighting the drift. Scale strictness by drift:
+        #   - Low drift (<0.10%): skip if 2+ indicators oppose (uncertain chop)
+        #   - Higher drift (>=0.10%): skip only if 3+ oppose (strong drift can override some)
         if open_price and open_price > 0 and direction != MarketDirection.HOLD:
             indicator_signals = [s for s in signals if s.name != "price_vs_open" and s.direction != MarketDirection.HOLD]
-            if len(indicator_signals) >= 3:
+            if len(indicator_signals) >= 2:
                 disagree_count = sum(1 for s in indicator_signals if s.direction != direction)
-                if disagree_count >= 3:
-                    logger.info(f"Agreement filter: {disagree_count}/4 indicators oppose {direction.value} — skipping")
+                abs_drift = abs(drift_pct) if drift_pct is not None else 0.0
+                if abs_drift < 0.10 and disagree_count >= 2:
+                    logger.info(f"Agreement filter (low drift): {disagree_count} indicators oppose {direction.value}, drift {abs_drift:.4f}% — skipping")
+                    return StrategyDecision(
+                        direction, confidence, signals, current_price, open_price,
+                        drift_pct, volatility, False,
+                        f"Signal conflict (low drift): {disagree_count} indicators oppose, drift only {abs_drift:.4f}%", 0.0,
+                    )
+                elif disagree_count >= 3:
+                    logger.info(f"Agreement filter: {disagree_count}/{len(indicator_signals)} indicators oppose {direction.value} — skipping")
                     return StrategyDecision(
                         direction, confidence, signals, current_price, open_price,
                         drift_pct, volatility, False,

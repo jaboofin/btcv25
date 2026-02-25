@@ -83,6 +83,7 @@ class BTCPredictionBot:
         self._5m_cycle_count = 0
         self._5m_last_anchor_price = None
         self._5m_trade_ids: set = set()  # Track 5m trade IDs for PnL routing
+        self._lw_trade_ids: set = set()  # Track late-window trade IDs for PnL routing
 
         # Independent arb scanner (runs its own loop when --arb is enabled)
         if config.edge.enable_arb:
@@ -200,6 +201,7 @@ class BTCPredictionBot:
 
             if not decision.should_trade:
                 logger.info(f"Cycle {self._cycle_count}: HOLD — {decision.reason}")
+                await self._notify_engine_event("15m", "hold", f"Cycle #{self._cycle_count}: {decision.reason}")
                 return
 
             # 5. Live bankroll sync + risk
@@ -207,6 +209,7 @@ class BTCPredictionBot:
             can_trade, reason = self.risk_manager.can_trade()
             if not can_trade:
                 logger.info(f"Cycle {self._cycle_count}: BLOCKED — {reason}")
+                await self._notify_engine_event("15m", "blocked", f"Cycle #{self._cycle_count}: {reason}")
                 return
 
             # 6. Markets — discover then filter to CURRENT window only
@@ -283,21 +286,27 @@ class BTCPredictionBot:
                 })
                 await self._notify_trade("opened", trade.direction, trade.size_usd,
                                          entry_price=trade.entry_price, engine="directional")
+                await self._refresh_dashboard()
 
-            # 8. Resolutions — route 5m PnL to separate tracker
+            # 8. Resolutions — route 5m/LW PnL to separate trackers
             resolved = await self.polymarket.check_resolutions()
             for r in resolved:
                 is_5m = r.trade_id in self._5m_trade_ids
+                is_lw = r.trade_id in self._lw_trade_ids
                 if is_5m:
                     self.risk_manager.record_5m_trade(0, pnl=r.pnl)
                     self._5m_trade_ids.discard(r.trade_id)
+                elif is_lw:
+                    self.risk_manager.record_late_window_trade(0, pnl=r.pnl)
+                    self._lw_trade_ids.discard(r.trade_id)
                 else:
                     self.risk_manager.record_trade(r.pnl)
                 self.trade_logger.log_resolution({"trade_id": r.trade_id, "outcome": r.outcome, "pnl": r.pnl})
+                engine_label = "directional_5m" if is_5m else ("late_window" if is_lw else "directional")
                 await self._notify_trade("resolved", r.direction, r.size_usd, pnl=r.pnl,
-                                         outcome=r.outcome, engine="directional_5m" if is_5m else "directional")
-
-            
+                                         outcome=r.outcome, engine=engine_label)
+            if resolved:
+                await self._refresh_dashboard()
 
             # 8. Status
             stats = self.polymarket.get_stats()
@@ -414,12 +423,14 @@ class BTCPredictionBot:
 
                 if not decision.should_trade:
                     logger.info(f"Late-window [{tf_label}]: HOLD — {decision.reason}")
+                    await self._notify_engine_event("lw", "hold", f"{tf_label} mkt: {decision.reason}")
                     continue
 
                 # 4. Risk check
                 can_trade, reason = self.risk_manager.can_late_window_trade()
                 if not can_trade:
                     logger.info(f"Late-window [{tf_label}]: BLOCKED — {reason}")
+                    await self._notify_engine_event("lw", "blocked", f"{tf_label} mkt: {reason}")
                     break  # Budget exhausted, stop scanning
 
                 # 5. Size + execute
@@ -430,13 +441,17 @@ class BTCPredictionBot:
                 direction = decision.direction.value
 
                 # Check entry price — skip if too expensive (tiny edge, not worth the risk)
-                entry_price = market.price_up if direction == "up" else market.price_down
-                max_entry = getattr(lw, 'max_entry_price', 0.80)
+                # Use CLOB best-ask price (what we'd actually pay) not Gamma mid-price
+                token_id_lw = market.token_id_up if direction == "up" else market.token_id_down
+                clob_entry = self.polymarket.get_clob_price(token_id_lw, side="BUY")
+                entry_price = clob_entry if clob_entry else (market.price_up if direction == "up" else market.price_down)
+                max_entry = getattr(lw, 'max_entry_price', 0.75)
                 if entry_price > max_entry:
                     logger.info(
                         f"Late-window [{tf_label}]: SKIP — entry price ${entry_price:.2f} too high "
                         f"(max ${max_entry:.2f}, only {(1.0 - entry_price)*100:.0f}¢ edge)"
                     )
+                    await self._notify_engine_event("lw", "skip", f"{tf_label} mkt: Entry ${entry_price:.2f} > max ${max_entry:.2f}")
                     continue
 
                 trade = await self.polymarket.place_order(
@@ -446,6 +461,7 @@ class BTCPredictionBot:
 
                 if trade:
                     self._late_window_traded_markets.add(market_lw_key)
+                    self._lw_trade_ids.add(trade.trade_id)
                     self.risk_manager.record_late_window_trade(size)
                     self.trade_logger.log_trade({
                         "type": "late_window",
@@ -460,6 +476,7 @@ class BTCPredictionBot:
                     })
                     await self._notify_trade("opened", trade.direction, trade.size_usd,
                                              entry_price=trade.entry_price, engine="late_window")
+                    await self._refresh_dashboard()
                     logger.info(
                         f"🔮 LATE-WINDOW [{tf_label}] {direction.upper()} | "
                         f"${size:.2f} @ conf={decision.confidence:.2f} | "
@@ -539,12 +556,14 @@ class BTCPredictionBot:
 
             if not decision.should_trade:
                 logger.info(f"[5m] Cycle {self._5m_cycle_count}: HOLD — {decision.reason}")
+                await self._notify_engine_event("5m", "hold", f"Cycle #{self._5m_cycle_count}: {decision.reason}")
                 return
 
             # 4. Risk check (separate 5m budget)
             can_trade, reason = self.risk_manager.can_trade_5m()
             if not can_trade:
                 logger.info(f"[5m] Cycle {self._5m_cycle_count}: BLOCKED — {reason}")
+                await self._notify_engine_event("5m", "blocked", f"Cycle #{self._5m_cycle_count}: {reason}")
                 return
 
             # 5. Discover + filter to current 5m window
@@ -553,6 +572,7 @@ class BTCPredictionBot:
             tradeable = self.polymarket.filter_current_window(tradeable, 5)
             if not tradeable:
                 logger.info(f"[5m] Cycle {self._5m_cycle_count}: No markets for current 5m window")
+                await self._notify_engine_event("5m", "no_markets", f"Cycle #{self._5m_cycle_count}: No 5m markets")
                 return
 
             market = max(tradeable, key=lambda m: m.liquidity)
@@ -581,6 +601,7 @@ class BTCPredictionBot:
                 })
                 await self._notify_trade("opened", trade.direction, trade.size_usd,
                                          entry_price=trade.entry_price, engine="directional_5m")
+                await self._refresh_dashboard()
                 logger.info(
                     f"⏱️ [5m] {direction.upper()} | ${size:.2f} @ conf={decision.confidence:.2f} | "
                     f"BTC=${consensus.price:,.2f}"
@@ -599,14 +620,22 @@ class BTCPredictionBot:
                 try:
                     resolved = await self.polymarket.check_resolutions()
                     for r in resolved:
-                        if r.trade_id in self._5m_trade_ids:
+                        is_5m = r.trade_id in self._5m_trade_ids
+                        is_lw = r.trade_id in self._lw_trade_ids
+                        if is_5m:
                             self.risk_manager.record_5m_trade(0, pnl=r.pnl)
                             self._5m_trade_ids.discard(r.trade_id)
+                        elif is_lw:
+                            self.risk_manager.record_late_window_trade(0, pnl=r.pnl)
+                            self._lw_trade_ids.discard(r.trade_id)
                         else:
                             self.risk_manager.record_trade(r.pnl)
                         self.trade_logger.log_resolution({"trade_id": r.trade_id, "outcome": r.outcome, "pnl": r.pnl})
+                        engine_label = "directional_5m" if is_5m else ("late_window" if is_lw else "directional")
                         await self._notify_trade("resolved", r.direction, r.size_usd, pnl=r.pnl,
-                                                 outcome=r.outcome, engine="directional_5m")
+                                                 outcome=r.outcome, engine=engine_label)
+                    if resolved:
+                        await self._refresh_dashboard()
                 except Exception:
                     pass
 
@@ -619,6 +648,7 @@ class BTCPredictionBot:
                     elif not self._5m_traded_this_window:
                         boundary = datetime.datetime.fromtimestamp(self._next_5m_boundary())
                         logger.info(f"⏱️ [5m] ENTRY — targeting {boundary.strftime('%H:%M')}")
+                        await self._notify_engine_event("5m", "entry", f"Targeting {boundary.strftime('%H:%M')}")
                         await self._5m_trading_cycle()
                         self._5m_traded_this_window = True
                 else:
@@ -767,6 +797,25 @@ class BTCPredictionBot:
         self.running = True
         self._start_time = time.time()
 
+        # ── Live bankroll sync on boot ────────────────────────────
+        # Always attempt to read actual CLOB balance at startup,
+        # regardless of --sync-live-bankroll flag.
+        try:
+            live_bal = await self.polymarket.get_available_balance_usd()
+            if live_bal is not None and live_bal > 0:
+                old_cap = self.risk_manager.capital
+                self.risk_manager.capital = round(float(live_bal), 2)
+                self.risk_manager._daily.start_of_day_capital = self.risk_manager.capital
+                self._last_live_bankroll_value = self.risk_manager.capital
+                logger.info(
+                    f"💰 Boot bankroll sync: ${old_cap:.2f} → ${self.risk_manager.capital:.2f} "
+                    f"(live CLOB balance)"
+                )
+            else:
+                logger.warning(f"⚠️ Boot bankroll sync: could not read live balance, using config ${self.risk_manager.capital:.2f}")
+        except Exception as e:
+            logger.warning(f"⚠️ Boot bankroll sync failed: {e} — using config ${self.risk_manager.capital:.2f}")
+
         while self.running:
             await self._refresh_directional_interval()
 
@@ -796,6 +845,26 @@ class BTCPredictionBot:
             await asyncio.sleep(self.config.sleep_poll_secs)
 
     # ── Dashboard Live Updates ──────────────────────────────────
+
+    async def _refresh_dashboard(self):
+        """Re-broadcast full state so positions table updates immediately."""
+        if not self.dashboard or not self.dashboard.is_running:
+            return
+        try:
+            state = build_dashboard_state(
+                cycle=self._cycle_count,
+                consensus=self._last_consensus,
+                anchor=self._last_anchor,
+                decision=self._last_decision,
+                risk_manager=self.risk_manager,
+                polymarket_client=self.polymarket,
+                edge_config=self.config.edge,
+                config=self.config,
+                arb_scanner=self.arb_scanner,
+            )
+            await self.dashboard.broadcast(state)
+        except Exception:
+            pass
 
     async def _price_push_loop(self):
         """Push live BTC price to dashboard every 2 seconds between cycles."""
@@ -843,6 +912,22 @@ class BTCPredictionBot:
                 "pnl": pnl,
                 "outcome": outcome,
                 "engine": engine,
+                "timestamp": time.time(),
+            }
+            await self.dashboard.broadcast(msg)
+        except Exception:
+            pass
+
+    async def _notify_engine_event(self, engine: str, action: str, detail: str = ""):
+        """Send engine lifecycle event to dashboard activity feed."""
+        if not self.dashboard or not self.dashboard.is_running:
+            return
+        try:
+            msg = {
+                "type": "engine_event",
+                "engine": engine,
+                "action": action,
+                "detail": detail,
                 "timestamp": time.time(),
             }
             await self.dashboard.broadcast(msg)

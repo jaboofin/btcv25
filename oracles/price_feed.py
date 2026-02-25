@@ -147,6 +147,40 @@ class OracleEngine:
 
     # ── Persistent RTDS Stream ──────────────────────────────────
 
+    async def _rtds_watchdog(self):
+        """
+        Background watchdog that monitors RTDS stream health.
+        If no Chainlink data arrives for 30s, force-closes the WebSocket
+        to trigger reconnection in start_rtds_stream.
+        """
+        STALE_THRESHOLD = 30  # seconds with no data = dead connection
+        CHECK_INTERVAL = 10  # check every 10s
+
+        while self._rtds_stream_running:
+            await asyncio.sleep(CHECK_INTERVAL)
+            if not self._rtds_stream_running:
+                break
+
+            last = self._rtds_last_success
+            if last <= 0:
+                continue  # Haven't received first message yet
+
+            age = time.time() - last
+            if age > STALE_THRESHOLD:
+                logger.warning(
+                    f"🐕 RTDS watchdog: no data for {age:.0f}s (threshold={STALE_THRESHOLD}s) "
+                    f"— force-closing WebSocket to trigger reconnect"
+                )
+                if self._rtds_ws and not self._rtds_ws.closed:
+                    try:
+                        await self._rtds_ws.close()
+                    except Exception:
+                        pass
+                # Reset last_success so we don't spam close
+                self._rtds_last_success = 0.0
+
+        logger.info("🐕 RTDS watchdog stopped")
+
     async def start_rtds_stream(self):
         """
         Persistent websocket loop that maintains a single connection
@@ -159,6 +193,9 @@ class OracleEngine:
         """
         self._rtds_stream_running = True
         logger.info("🔌 RTDS persistent stream starting...")
+
+        # Launch watchdog to detect stale connections
+        watchdog_task = asyncio.create_task(self._rtds_watchdog())
 
         while self._rtds_stream_running:
             self._rtds_total_attempts += 1
@@ -232,7 +269,8 @@ class OracleEngine:
                                 self._chainlink_ts = ts
                                 self._rtds_last_success = time.time()
                                 self._rtds_total_successes += 1
-                                logger.info(f"✅ Chainlink BTC/USD: ${price:,.2f} (RTDS)")
+                                if self._rtds_total_successes % 30 == 1:
+                                    logger.info(f"✅ Chainlink BTC/USD: ${price:,.2f} (RTDS, msg #{self._rtds_total_successes})")
 
                         elif topic == "crypto_prices":
                             if payload.get("symbol") == "btcusdt" and "value" in payload:
@@ -279,6 +317,7 @@ class OracleEngine:
             self._rtds_reconnect_backoff = min(self._rtds_reconnect_backoff * 2, 120.0)
 
         logger.info("🔌 RTDS persistent stream stopped")
+        watchdog_task.cancel()
 
     # ── Chainlink via Persistent RTDS Stream ────────────────────
 

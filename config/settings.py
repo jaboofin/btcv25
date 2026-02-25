@@ -53,7 +53,7 @@ class PolymarketConfig:
 
 @dataclass
 class StrategyConfig:
-    confidence_threshold: float = 0.60
+    confidence_threshold: float = 0.72
     strong_signal_threshold: float = 0.75
     rsi_period: int = 14
     rsi_overbought: float = 70.0
@@ -128,8 +128,8 @@ class LateWindowConfig:
     max_entry_price: float = 0.80         # skip if token > 80¢ (need 20¢+ edge per win)
     # Budget: separate from main directional trades
     max_daily_trades: int = 12            # fewer but higher quality
-    budget_pct: float = 25.0              # % of daily budget reserved for late-window (reduced)
-    max_trade_size_usd: float = 8.0       # max USD per late-window trade (reduced from 10)
+    budget_pct: float = 40.0              # % of daily budget reserved for late-window
+    max_trade_size_usd: float = 5.0       # max USD per late-window trade (more trades, smaller risk)
 
 
 @dataclass
@@ -157,9 +157,9 @@ class Active5mConfig:
     """Phase 3: Parallel 5-minute directional trading loop."""
     enabled: bool = False                 # --5m to turn on
     # ── Budget (separate from 15m) ──
-    budget_pct: float = 30.0              # % of bankroll allocated to 5m trades
+    budget_pct: float = 50.0              # % of bankroll allocated to 5m trades
     max_daily_trades: int = 30            # 5m trades per day (more windows = higher limit)
-    max_trade_size_usd: float = 10.0      # max USD per 5m trade
+    max_trade_size_usd: float = 3.0       # max USD per 5m trade
     max_daily_loss_pct: float = 15.0      # separate loss circuit breaker for 5m
     max_consecutive_losses: int = 4       # tighter than 15m since faster feedback
     loss_streak_cooldown_mins: int = 30   # shorter cooldown (30min vs 60min for 15m)
